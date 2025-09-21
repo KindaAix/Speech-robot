@@ -96,3 +96,4 @@ logs
 # 忽略指定文件/文件夹
 dataset/
 test.py
+whisper_dataset.jsonl
