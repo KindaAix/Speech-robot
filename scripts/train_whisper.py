@@ -1,205 +1,182 @@
-"""Full training script using Hugging Face Trainer (Seq2SeqTrainer) for Whisper fine-tuning.
-
-This script:
-- Loads a JSONL dataset with fields `audio_filepath` and `text`.
-- Preprocesses audio to Whisper input features and tokenizes text into labels.
-- Uses `Seq2SeqTrainer` for training/evaluation and computes WER with `jiwer`.
-
-Notes:
-- Adjust hyperparameters and batch sizes to match your GPU memory.
-"""
-import os
 import argparse
-import soundfile as sf
-import numpy as np
-from datasets import load_dataset, DatasetDict
-from transformers import (
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
-    Seq2SeqTrainingArguments,
-    Seq2SeqTrainer,
-)
-import evaluate
+import json
+import os
+from typing import List, Dict
+
 import torch
+from torch.utils.data import Dataset
+
+import librosa
+
+from transformers import (
+	WhisperProcessor,
+	WhisperForConditionalGeneration,
+	TrainingArguments,
+	Trainer,
+)
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument('--jsonl', type=str, default='dataset/data.jsonl')
-    p.add_argument('--model', type=str, default='openai/whisper-base')
-    p.add_argument('--output_dir', type=str, default='outputs/whisper_finetuned')
-    p.add_argument('--per_device_train_batch_size', type=int, default=8)
-    p.add_argument('--per_device_eval_batch_size', type=int, default=2)
-    p.add_argument('--learning_rate', type=float, default=1e-5)
-    p.add_argument('--num_train_epochs', type=int, default=5)
-    p.add_argument('--seed', type=int, default=42)
-    # LoRA / PEFT options
-    p.add_argument('--use_lora', action='store_true', help='Enable LoRA fine-tuning via PEFT')
-    p.add_argument('--lora_r', type=int, default=8, help='LoRA rank')
-    p.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha')
-    p.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
-    p.add_argument('--lora_target_modules', type=str, default='q_proj,k_proj,v_proj',
-                   help='Comma-separated target modules for LoRA (e.g. "q_proj,k_proj,v_proj")')
-    return p.parse_args()
+class WhisperDataset(Dataset):
+	"""PyTorch Dataset for Whisper finetuning using a simple jsonl manifest.
+
+	Each line in the jsonl should be a JSON object with at least:
+	  - audio_filepath: absolute or relative path to wav file
+	  - text: transcription string
+
+	The dataset returns pre-extracted features and tokenized labels.
+	"""
+
+	def __init__(self, manifest_path: str, processor: WhisperProcessor, audio_sr: int = 16000):
+		self.processor = processor
+		self.audio_sr = audio_sr
+		self.samples: List[Dict] = []
+		with open(manifest_path, 'r', encoding='utf-8') as f:
+			for line in f:
+				line = line.strip()
+				if not line:
+					continue
+				try:
+					obj = json.loads(line)
+				except json.JSONDecodeError:
+					continue
+				# Expect keys 'audio_filepath' and 'text'
+				if 'audio_filepath' in obj and 'text' in obj:
+					self.samples.append({'audio': obj['audio_filepath'], 'text': obj['text']})
+
+	def __len__(self):
+		return len(self.samples)
+
+	def __getitem__(self, idx: int):
+		sample = self.samples[idx]
+		audio_path = sample['audio']
+		transcription = sample['text']
+
+		# Load audio
+		try:
+			audio, sr = librosa.load(audio_path, sr=self.audio_sr)
+		except Exception as e:
+			raise RuntimeError(f"Failed loading {audio_path}: {e}")
+
+		# Processor.feature_extractor expects a list/array of floats
+		input_features = self.processor.feature_extractor(audio, sampling_rate=self.audio_sr).input_features[0]
+
+		# Tokenize transcription into labels (list[int])
+		# WhisperProcessor may not have `as_target_processor()` in some transformers versions.
+		# Prefer using tokenizer(..., text_target=...) when available, otherwise fall back.
+		try:
+			# new tokenizers support text_target so we can get label ids directly
+			tokenized = self.processor.tokenizer(transcription, text_target=transcription) if 'text_target' in self.processor.tokenizer.__call__.__code__.co_varnames else None
+		except Exception:
+			tokenized = None
+
+		if tokenized is not None:
+			labels_ids = tokenized['input_ids']
+		else:
+			# Fallback: call tokenizer directly; many tokenizers expect to be used under as_target_processor,
+			# but calling tokenizer on the string still returns input_ids for the text.
+			labels_ids = self.processor.tokenizer(transcription).input_ids
+
+		return {'input_features': input_features, 'labels': labels_ids}
 
 
-def prepare_dataset(jsonl_path, processor, sampling_rate=16000, split={'train':0.95,'validation':0.05}):
-    # 1. 加载 jsonl，但不要 cast_column
-    ds = load_dataset('json', data_files=jsonl_path, split='train')
+def data_collator(batch: List[Dict], processor: WhisperProcessor):
+	"""Collate list of examples into batch dict suitable for WhisperForConditionalGeneration.
 
-    # 2. 切分
-    if isinstance(split, dict):
-        total = len(ds)
-        n_val = max(1, int(total * split.get('validation', 0.05)))
-        ds = ds.train_test_split(test_size=n_val, seed=42)
-        ds = DatasetDict({'train': ds['train'], 'validation': ds['test']})
+	Returns dict with 'input_features' and 'labels' tensors.
+	"""
+	import numpy as np
 
-    # 3. map 函数：手动用 soundfile/ librosa 读 wav
-    def speech_map(batch, processor, sampling_rate, max_target_length):
-        speech, sr = sf.read(batch['audio_filepath'])
-        if sr != sampling_rate:
-            import librosa
-            speech = librosa.resample(speech, orig_sr=sr, target_sr=sampling_rate)
-        input_features = processor.feature_extractor(speech, sampling_rate=sampling_rate).input_features[0]
-        labels = processor.tokenizer(batch['text']).input_ids
-        if len(labels) > max_target_length:
-            labels = labels[:max_target_length]
-        return {'input_features': input_features, 'labels': labels}
+	input_features = [ex['input_features'] for ex in batch]
+	labels = [ex['labels'] for ex in batch]
 
-    from functools import partial
-    map_fn = partial(speech_map, processor=processor, sampling_rate=sampling_rate, max_target_length=128)
+	input_features = torch.tensor(np.stack(input_features), dtype=torch.float32)
 
-    ds_proc = {k: v.map(map_fn, remove_columns=['audio_filepath','text'], batched=False) for k, v in ds.items()}
-    return DatasetDict(ds_proc)
+	# Pad labels using the tokenizer
+	padded = processor.tokenizer.pad({'input_ids': labels}, padding=True, return_tensors='pt')
+	labels_tensor = padded['input_ids']
 
+	# Replace padding ids with -100 as ignored index for loss
+	labels_tensor[labels_tensor == processor.tokenizer.pad_token_id] = -100
 
-
-class DataCollatorSpeechSeq2Seq:
-    """Data collator to pad input_features and labels for seq2seq training."""
-
-    def __init__(self, processor, padding=True):
-        self.processor = processor
-        self.padding = padding
-
-    def __call__(self, features):
-        input_features = [f['input_features'] for f in features]
-        labels = [f['labels'] for f in features]
-        batch = {}
-        batch_inputs = self.processor.feature_extractor.pad(
-            {'input_features': input_features}, return_tensors='pt'
-        )
-        # pad labels using tokenizer
-        batch_labels = self.processor.tokenizer.pad(
-            {'input_ids': labels}, return_tensors='pt'
-        )
-        # replace padding token id's in labels by -100 so they are ignored by loss
-        labels_ids = batch_labels['input_ids'].masked_fill(batch_labels['attention_mask'] == 0, -100)
-        batch['input_features'] = batch_inputs['input_features']
-        batch['labels'] = labels_ids
-        return batch
-
-
-def compute_metrics(pred, processor):
-    """Decode generated token ids and compute WER against labels.
-
-    This function is intended to be used with `predict_with_generate=True`, so
-    `pred.predictions` are the generated token ids from `model.generate()`.
-    """
-    wer_metric = evaluate.load('wer')
-    preds = pred.predictions
-    # some trainers return a tuple (preds, scores)
-    if isinstance(preds, tuple):
-        preds = preds[0]
-    # decode predictions
-    try:
-        pred_str = processor.tokenizer.batch_decode(preds, skip_special_tokens=True)
-    except Exception:
-        # fallback: ensure numpy
-        pred_str = processor.tokenizer.batch_decode(preds.tolist(), skip_special_tokens=True)
-
-    # prepare labels: replace -100 with pad_token_id before decoding
-    labels = pred.label_ids
-    labels[np.where(labels == -100)] = processor.tokenizer.pad_token_id
-    try:
-        label_str = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
-    except Exception:
-        label_str = processor.tokenizer.batch_decode(labels.tolist(), skip_special_tokens=True)
-
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    return {'wer': wer}
+	return {'input_features': input_features, 'labels': labels_tensor}
 
 
 def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-    torch.manual_seed(args.seed)
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--manifest', type=str, default='dataset/data.jsonl', help='Path to jsonl manifest')
+	parser.add_argument('--model_name', type=str, default='openai/whisper-medium', help='Pretrained Whisper model')
+	parser.add_argument('--output_dir', type=str, default='outputs/whisper_finetuned', help='Output dir for checkpoints/logs')
+	parser.add_argument('--per_device_train_batch_size', type=int, default=8)
+	parser.add_argument('--per_device_eval_batch_size', type=int, default=8)
+	parser.add_argument('--num_train_epochs', type=int, default=3)
+	parser.add_argument('--learning_rate', type=float, default=1e-5)
+	parser.add_argument('--logging_steps', type=int, default=100)
+	parser.add_argument('--save_steps', type=int, default=500)
+	parser.add_argument('--max_train_samples', type=int, default=None)
+	args = parser.parse_args()
 
-    print('Loading processor and model:', args.model)
-    processor = WhisperProcessor.from_pretrained(args.model)
-    model = WhisperForConditionalGeneration.from_pretrained(args.model)
+	os.makedirs(args.output_dir, exist_ok=True)
+	os.makedirs(os.path.join(args.output_dir, 'logs'), exist_ok=True)
 
-    # optionally wrap with PEFT/LoRA
-    if args.use_lora:
-        try:
-            from peft import LoraConfig, get_peft_model, TaskType
-        except Exception as e:
-            raise ImportError('peft not installed. Run: pip install peft')
-        # validate target modules against model parameter names; if not found try to auto-detect common names
-        lora_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=args.lora_target_modules.split(','),
-            lora_dropout=args.lora_dropout,
-            bias='none',
-            task_type=TaskType.SEQ_2_SEQ_LM,
-        )
-        print('Applying LoRA with config:', lora_config)
-        model = get_peft_model(model, lora_config)
+	print('Loading processor...')
+	processor = WhisperProcessor.from_pretrained(args.model_name)
 
-    print('Preparing dataset...')
-    ds = prepare_dataset(args.jsonl, processor)
-    print('Dataset sizes:', {k: len(v) for k, v in ds.items()})
+	print('Loading model...')
+	model = WhisperForConditionalGeneration.from_pretrained(args.model_name)
 
-    # data collator
-    data_collator = DataCollatorSpeechSeq2Seq(processor=processor)
+	# If the model has a forced_decoder_ids or generation config, you might want to set language/tokens here.
+	# Example: processor.tokenizer.set_prefix_tokens_for_generation(language='zh') is not a real API here,
+	# but users can set model.config.forced_decoder_ids if needed.
 
-    # training args
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=args.output_dir,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        learning_rate=args.learning_rate,
-        num_train_epochs=args.num_train_epochs,
-        fp16=torch.cuda.is_available(),
-        save_total_limit=3,
-        eval_strategy='steps',
-        eval_steps=500,
-        save_steps=200,
-        logging_steps=100,
-        remove_unused_columns=False,
-        dataloader_num_workers=0
-    )
+	print('Loading dataset...')
+	dataset = WhisperDataset(args.manifest, processor)
 
-    # trainer
-    # wrap compute_metrics so it has access to processor
-    def _compute(pred):
-        return compute_metrics(pred, processor)
+	if args.max_train_samples:
+		dataset.samples = dataset.samples[: args.max_train_samples]
 
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=ds['train'],
-        eval_dataset=ds['validation'],
-        data_collator=data_collator,
-        processing_class=processor.tokenizer,
-        compute_metrics=_compute,
-    )
+	# Simple split: small eval split
+	n = len(dataset)
+	train_size = int(0.95 * n)
+	train_dataset = torch.utils.data.Subset(dataset, list(range(0, train_size)))
+	eval_dataset = torch.utils.data.Subset(dataset, list(range(train_size, n))) if n - train_size > 0 else None
 
-    # train
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    processor.save_pretrained(args.output_dir)
+	def collate_fn(batch):
+		return data_collator(batch, processor)
+
+	training_args = TrainingArguments(
+		output_dir=args.output_dir,
+		per_device_train_batch_size=args.per_device_train_batch_size,
+		per_device_eval_batch_size=args.per_device_eval_batch_size,
+		num_train_epochs=args.num_train_epochs,
+		learning_rate=args.learning_rate,
+		logging_steps=args.logging_steps,
+		save_steps=args.save_steps,
+		eval_strategy='steps' if eval_dataset is not None else 'no',
+		eval_accumulation_steps=50,
+		save_total_limit=3,
+		fp16=torch.cuda.is_available(),
+		report_to=['none'],
+		remove_unused_columns=False,
+		push_to_hub=False,
+		load_best_model_at_end=False,
+		logging_dir=os.path.join(args.output_dir, 'logs'),
+	)
+
+	# Trainer will call model(input_features=..., labels=...)
+	trainer = Trainer(
+		model=model,
+		args=training_args,
+		train_dataset=train_dataset,
+		eval_dataset=eval_dataset,
+		data_collator=collate_fn,
+	)
+
+	print('Starting training...')
+	trainer.train()
+
+	print('Saving final model...')
+	trainer.save_model(args.output_dir)
 
 
 if __name__ == '__main__':
-    main()
+	main()
