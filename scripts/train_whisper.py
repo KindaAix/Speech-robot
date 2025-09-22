@@ -104,7 +104,7 @@ def data_collator(batch: List[Dict], processor: WhisperProcessor):
 def main():
 	parser = argparse.ArgumentParser()
 	parser.add_argument('--manifest', type=str, default='dataset/data.jsonl', help='Path to jsonl manifest')
-	parser.add_argument('--model_name', type=str, default='openai/whisper-medium', help='Pretrained Whisper model')
+	parser.add_argument('--model_name', type=str, default='openai/whisper-small', help='Pretrained Whisper model')
 	parser.add_argument('--output_dir', type=str, default='outputs/whisper_finetuned', help='Output dir for checkpoints/logs')
 	parser.add_argument('--per_device_train_batch_size', type=int, default=8)
 	parser.add_argument('--per_device_eval_batch_size', type=int, default=8)
